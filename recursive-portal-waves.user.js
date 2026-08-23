@@ -2,8 +2,8 @@
 // @id             recursive-portal-waves
 // @name           IITC plugin: Recursive Portal Waves
 // @category       Layer
-// @version        0.1.0
-// @description    Show recursive portal lists as area and wave layers on IITC-CE.
+// @version        0.2.0
+// @description    Show recursive portal wave coordinate lists as IITC-CE layers.
 // @match          https://intel.ingress.com/*
 // @grant          none
 // ==/UserScript==
@@ -26,6 +26,15 @@
     plugin.STORAGE_KEY = 'plugin-recursive-portal-waves-input';
     plugin.CODE_RE = /^(.+)W(\d+)R(\d+)D(\d+)$/;
     plugin.GUID_RE = /^[0-9a-f]{32}\.\d+$/;
+    plugin.WAVE_RE = /^W(\d+)$/i;
+    plugin.POINT_RE = /^(\d+(?:\.\d+)?)x$/i;
+    plugin.COORD_MATCH_EPSILON = 0.000001;
+
+    plugin.labels = {
+      rescan: '\u73fe\u5728\u306eMAP\u3067\u518d\u7167\u5408',
+      fit: '\u8868\u793a\u6e08\u307f\u30dd\u30fc\u30bf\u30eb\u3078\u79fb\u52d5',
+      clear: '\u5168\u524a\u9664'
+    };
 
     plugin.state = {
       isSetup: false,
@@ -38,11 +47,161 @@
       loadedLatLngs: [],
       stats: {
         total: 0,
-        loadedMarkers: 0,
+        drawnMarkers: 0,
+        coordinateRows: 0,
         unresolvedGuids: 0,
         errors: 0,
         duplicates: 0
       }
+    };
+
+    plugin.isCommentOrBlank = function (line) {
+      var trimmed = String(line || '').trim();
+      return !trimmed || trimmed.indexOf('#') === 0 || trimmed.indexOf('//') === 0;
+    };
+
+    plugin.parseNumber = function (value) {
+      var number = Number(value);
+      return typeof number === 'number' && isFinite(number) ? number : null;
+    };
+
+    plugin.parseCoordinateRow = function (rawLine, lineNumber, errors) {
+      var parts = rawLine.trim().split('|').map(function (part) {
+        return part.trim();
+      });
+      var waveMatch;
+      var lat;
+      var lng;
+      var pointMatch;
+
+      if (parts.length !== 4) {
+        errors.push({
+          line: lineNumber,
+          reason: 'Expected four pipe-separated columns: Wn|lat|lng|pointsx.',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      waveMatch = plugin.WAVE_RE.exec(parts[0]);
+      if (!waveMatch) {
+        errors.push({
+          line: lineNumber,
+          reason: 'Wave column must look like W1, W2, ...',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      lat = plugin.parseNumber(parts[1]);
+      if (lat === null || lat < -90 || lat > 90) {
+        errors.push({
+          line: lineNumber,
+          reason: 'Latitude must be a number from -90 to 90.',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      lng = plugin.parseNumber(parts[2]);
+      if (lng === null || lng < -180 || lng > 180) {
+        errors.push({
+          line: lineNumber,
+          reason: 'Longitude must be a number from -180 to 180.',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      pointMatch = plugin.POINT_RE.exec(parts[3]);
+      if (!pointMatch) {
+        errors.push({
+          line: lineNumber,
+          reason: 'Point column must look like 10x, 13x, 50x, ...',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      return {
+        source: 'coordinate',
+        line: lineNumber,
+        code: parts.join('|'),
+        area: '',
+        wave: parseInt(waveMatch[1], 10),
+        waveText: waveMatch[1],
+        point: parseFloat(pointMatch[1]),
+        pointText: pointMatch[1],
+        lat: lat,
+        lng: lng,
+        guid: null
+      };
+    };
+
+    plugin.parseGuidRow = function (rawLine, lineNumber, errors) {
+      var parts = rawLine.trim().split(/[\t ,]+/).filter(Boolean);
+      var code;
+      var guid;
+      var match;
+
+      if (parts.length !== 2) {
+        errors.push({
+          line: lineNumber,
+          reason: parts.length < 2 ? 'Code and GUID are required.' : 'Expected exactly two columns.',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      code = parts[0];
+      guid = parts[1];
+      match = plugin.CODE_RE.exec(code);
+      if (!match) {
+        errors.push({
+          line: lineNumber,
+          reason: 'Code does not match ^(.+)W(\\d+)R(\\d+)D(\\d+)$.',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      if (!plugin.GUID_RE.test(guid)) {
+        errors.push({
+          line: lineNumber,
+          reason: 'GUID does not match ^[0-9a-f]{32}\\.\\d+$.',
+          raw: rawLine
+        });
+        return null;
+      }
+
+      return {
+        source: 'guid',
+        line: lineNumber,
+        code: code,
+        area: match[1],
+        wave: parseInt(match[2], 10),
+        waveText: match[2],
+        point: parseInt(match[3], 10),
+        pointText: match[3],
+        dNumber: parseInt(match[4], 10),
+        dNumberText: match[4],
+        lat: null,
+        lng: null,
+        guid: guid
+      };
+    };
+
+    plugin.entryKey = function (entry) {
+      if (entry.source === 'coordinate') {
+        return [
+          entry.source,
+          entry.waveText,
+          entry.lat.toFixed(6),
+          entry.lng.toFixed(6),
+          entry.pointText
+        ].join('|');
+      }
+      return [entry.source, entry.code, entry.guid].join('|');
     };
 
     plugin.parseInput = function (rawInput) {
@@ -54,68 +213,30 @@
 
       lines.forEach(function (line, index) {
         var lineNumber = index + 1;
-        var rawLine = line;
-        var trimmed = rawLine.trim();
-        var parts;
-        var code;
-        var guid;
-        var match;
+        var entry;
         var key;
 
-        if (!trimmed || trimmed.indexOf('#') === 0 || trimmed.indexOf('//') === 0) {
+        if (plugin.isCommentOrBlank(line)) {
           return;
         }
 
-        parts = trimmed.split(/[\t ,]+/).filter(Boolean);
-        if (parts.length !== 2) {
-          errors.push({
-            line: lineNumber,
-            reason: parts.length < 2 ? 'Code and GUID are required.' : 'Expected exactly two columns.',
-            raw: rawLine
-          });
+        if (line.indexOf('|') !== -1) {
+          entry = plugin.parseCoordinateRow(line, lineNumber, errors);
+        } else {
+          entry = plugin.parseGuidRow(line, lineNumber, errors);
+        }
+
+        if (!entry) {
           return;
         }
 
-        code = parts[0];
-        guid = parts[1];
-        match = plugin.CODE_RE.exec(code);
-        if (!match) {
-          errors.push({
-            line: lineNumber,
-            reason: 'Code does not match ^(.+)W(\\d+)R(\\d+)D(\\d+)$.',
-            raw: rawLine
-          });
-          return;
-        }
-
-        if (!plugin.GUID_RE.test(guid)) {
-          errors.push({
-            line: lineNumber,
-            reason: 'GUID does not match ^[0-9a-f]{32}\\.\\d+$.',
-            raw: rawLine
-          });
-          return;
-        }
-
-        key = code + '\n' + guid;
+        key = plugin.entryKey(entry);
         if (seen[key]) {
           duplicates += 1;
           return;
         }
         seen[key] = true;
-
-        entries.push({
-          line: lineNumber,
-          code: code,
-          area: match[1],
-          wave: parseInt(match[2], 10),
-          waveText: match[2],
-          rPoint: parseInt(match[3], 10),
-          rPointText: match[3],
-          dNumber: parseInt(match[4], 10),
-          dNumberText: match[4],
-          guid: guid
-        });
+        entries.push(entry);
       });
 
       return {
@@ -147,7 +268,10 @@
     };
 
     plugin.layerKeyForEntry = function (entry) {
-      return entry.area + ' / W' + entry.waveText;
+      if (entry.area) {
+        return entry.area + ' / W' + entry.waveText;
+      }
+      return 'W' + entry.waveText;
     };
 
     plugin.colorForWave = function (wave) {
@@ -186,30 +310,61 @@
       return null;
     };
 
+    plugin.findLoadedPortalGuidAt = function (latLng) {
+      var portals = window.portals || {};
+      var guids = Object.keys(portals);
+      var i;
+      var portalLatLng;
+
+      for (i = 0; i < guids.length; i += 1) {
+        portalLatLng = plugin.getPortalLatLng(portals[guids[i]]);
+        if (!portalLatLng) {
+          continue;
+        }
+        if (
+          Math.abs(portalLatLng.lat - latLng.lat) <= plugin.COORD_MATCH_EPSILON &&
+          Math.abs(portalLatLng.lng - latLng.lng) <= plugin.COORD_MATCH_EPSILON
+        ) {
+          return guids[i];
+        }
+      }
+      return null;
+    };
+
     plugin.forwardPortalClick = function (guid, originalEvent) {
       var portal = window.portals && window.portals[guid];
 
       if (!portal) {
-        return;
+        return false;
       }
       if (typeof portal.fire === 'function') {
         portal.fire('click', { originalEvent: originalEvent });
-        return;
+        return true;
       }
       if (typeof portal.fireEvent === 'function') {
         portal.fireEvent('click', { originalEvent: originalEvent });
-        return;
+        return true;
       }
       if (typeof window.renderPortalDetails === 'function') {
         window.renderPortalDetails(guid);
+        return true;
       }
+      return false;
+    };
+
+    plugin.markerTitle = function (entry) {
+      if (entry.source === 'coordinate') {
+        return 'W' + entry.waveText + ' ' + entry.pointText + 'x (' + entry.lat + ', ' + entry.lng + ')';
+      }
+      return entry.code;
     };
 
     plugin.createMarker = function (entry, latLng) {
-      var highValue = entry.rPoint >= 50;
+      var highValue = entry.point >= 50;
       var color = plugin.colorForWave(entry.wave);
       var size = highValue ? 38 : 30;
-      var label = 'D' + entry.dNumberText;
+      var primaryLabel = entry.source === 'coordinate' ? entry.pointText + 'x' : 'D' + entry.dNumberText;
+      var secondaryLabel = entry.source === 'coordinate' ? 'W' + entry.waveText : 'R' + entry.pointText;
       var marker;
       var icon = L.divIcon({
         className: 'rpw-div-icon',
@@ -221,11 +376,11 @@
           '" style="--rpw-wave-color:',
           color,
           '">',
-          '<span class="rpw-marker-d">',
-          plugin.escapeHtml(label),
+          '<span class="rpw-marker-main">',
+          plugin.escapeHtml(primaryLabel),
           '</span>',
-          '<span class="rpw-marker-r">R',
-          plugin.escapeHtml(entry.rPointText),
+          '<span class="rpw-marker-sub">',
+          plugin.escapeHtml(secondaryLabel),
           '</span>',
           '</div>'
         ].join('')
@@ -235,10 +390,13 @@
         icon: icon,
         interactive: true,
         keyboard: false,
-        title: entry.code
+        title: plugin.markerTitle(entry)
       });
       marker.on('click', function (event) {
-        plugin.forwardPortalClick(entry.guid, event.originalEvent);
+        var guid = entry.guid || plugin.findLoadedPortalGuidAt(latLng);
+        if (guid) {
+          plugin.forwardPortalClick(guid, event.originalEvent);
+        }
       });
       return marker;
     };
@@ -314,23 +472,46 @@
       return plugin.state.stats;
     };
 
+    plugin.latLngForEntry = function (entry, unresolved) {
+      var portal;
+      var latLng;
+
+      if (entry.source === 'coordinate') {
+        return L.latLng(entry.lat, entry.lng);
+      }
+
+      portal = window.portals && window.portals[entry.guid];
+      if (!portal) {
+        unresolved[entry.guid] = true;
+        return null;
+      }
+      latLng = plugin.getPortalLatLng(portal);
+      if (!latLng) {
+        unresolved[entry.guid] = true;
+      }
+      return latLng;
+    };
+
     plugin.redraw = function () {
       var unresolved = {};
       var loadedLatLngs = [];
-      var loadedMarkers = 0;
+      var drawnMarkers = 0;
+      var coordinateRows = 0;
 
       Object.keys(plugin.state.layerGroups).forEach(function (key) {
         plugin.state.layerGroups[key].clearLayers();
       });
 
       plugin.state.entries.forEach(function (entry) {
-        var portal = window.portals && window.portals[entry.guid];
-        var latLng = plugin.getPortalLatLng(portal);
+        var latLng = plugin.latLngForEntry(entry, unresolved);
         var key;
         var marker;
 
+        if (entry.source === 'coordinate') {
+          coordinateRows += 1;
+        }
+
         if (!latLng) {
-          unresolved[entry.guid] = true;
           return;
         }
 
@@ -342,13 +523,14 @@
         marker = plugin.createMarker(entry, latLng);
         plugin.state.layerGroups[key].addLayer(marker);
         loadedLatLngs.push(latLng);
-        loadedMarkers += 1;
+        drawnMarkers += 1;
       });
 
       plugin.state.loadedLatLngs = loadedLatLngs;
       plugin.state.stats = {
         total: plugin.state.entries.length,
-        loadedMarkers: loadedMarkers,
+        drawnMarkers: drawnMarkers,
+        coordinateRows: coordinateRows,
         unresolvedGuids: Object.keys(unresolved).length,
         errors: plugin.state.errors.length,
         duplicates: plugin.state.duplicates
@@ -360,7 +542,7 @@
       var bounds;
 
       if (!window.map || !plugin.state.loadedLatLngs.length) {
-        window.alert('No loaded Recursive Waves portals are visible in the current map data.');
+        window.alert('No Recursive Waves markers are drawn.');
         return;
       }
 
@@ -375,7 +557,8 @@
       plugin.state.duplicates = 0;
       plugin.state.stats = {
         total: 0,
-        loadedMarkers: 0,
+        drawnMarkers: 0,
+        coordinateRows: 0,
         unresolvedGuids: 0,
         errors: 0,
         duplicates: 0
@@ -418,11 +601,14 @@
         stats.total,
         '</strong><span>valid rows</span></div>',
         '<div><strong>',
-        stats.loadedMarkers,
+        stats.drawnMarkers,
         '</strong><span>drawn markers</span></div>',
         '<div><strong>',
+        stats.coordinateRows,
+        '</strong><span>coordinate rows</span></div>',
+        '<div><strong>',
         stats.unresolvedGuids,
-        '</strong><span>unloaded GUIDs</span></div>',
+        '</strong><span>unresolved GUID rows</span></div>',
         '<div><strong>',
         stats.errors,
         '</strong><span>input errors</span></div>',
@@ -448,12 +634,18 @@
         '<div id="',
         dialogId,
         '" class="rpw-dialog">',
-        '<textarea class="rpw-input" spellcheck="false" placeholder="20260530KureeW1R10D001    1f02b59e7fbb3457be0643de5b004b3c.16"></textarea>',
+        '<textarea class="rpw-input" spellcheck="false" placeholder="W1|37.529022|126.928673|50x&#10;W2|37.520407|126.940686|10x"></textarea>',
         '<div class="rpw-actions">',
         '<button type="button" class="rpw-apply">Apply</button>',
-        '<button type="button" class="rpw-rescan">現在のMAPで再照合</button>',
-        '<button type="button" class="rpw-fit">表示済みポータルへ移動</button>',
-        '<button type="button" class="rpw-clear">全削除</button>',
+        '<button type="button" class="rpw-rescan">',
+        plugin.labels.rescan,
+        '</button>',
+        '<button type="button" class="rpw-fit">',
+        plugin.labels.fit,
+        '</button>',
+        '<button type="button" class="rpw-clear">',
+        plugin.labels.clear,
+        '</button>',
         '</div>',
         '<div class="rpw-stats">',
         plugin.renderStatsHtml(),
@@ -501,7 +693,7 @@
         '.rpw-input{box-sizing:border-box;width:100%;min-height:240px;resize:vertical;font-family:monospace;font-size:12px;line-height:1.45;}',
         '.rpw-actions{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;}',
         '.rpw-actions button{min-height:32px;padding:4px 10px;}',
-        '.rpw-stat-grid{display:grid;grid-template-columns:repeat(5,minmax(86px,1fr));gap:6px;margin-top:8px;}',
+        '.rpw-stat-grid{display:grid;grid-template-columns:repeat(6,minmax(82px,1fr));gap:6px;margin-top:8px;}',
         '.rpw-stat-grid div{border:1px solid #555;background:#1f1f1f;padding:6px;border-radius:4px;}',
         '.rpw-stat-grid strong{display:block;font-size:18px;line-height:1.1;color:#fff;}',
         '.rpw-stat-grid span{display:block;font-size:11px;color:#bbb;}',
@@ -512,8 +704,8 @@
         '.rpw-div-icon{background:transparent;border:0;}',
         '.rpw-marker{box-sizing:border-box;width:100%;height:100%;border-radius:50%;border:2px solid #fff;background:var(--rpw-wave-color);box-shadow:0 0 0 2px rgba(0,0,0,.72),0 0 12px var(--rpw-wave-color);display:flex;align-items:center;justify-content:center;flex-direction:column;color:#fff;text-shadow:0 1px 2px #000;font-family:Arial,sans-serif;font-weight:700;line-height:1;}',
         '.rpw-marker-r50{border-width:3px;box-shadow:0 0 0 2px #fff,0 0 0 5px rgba(0,0,0,.76),0 0 18px 5px var(--rpw-wave-color);}',
-        '.rpw-marker-d{font-size:11px;}',
-        '.rpw-marker-r{font-size:10px;margin-top:1px;}',
+        '.rpw-marker-main{font-size:11px;}',
+        '.rpw-marker-sub{font-size:10px;margin-top:1px;}',
         '@media (max-width:520px){.rpw-input{min-height:180px;font-size:11px;}.rpw-actions button{flex:1 1 48%;padding:4px 6px;}.rpw-stat-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.rpw-stat-grid div{padding:5px;}.ui-dialog{max-width:calc(100vw - 10px)!important;}}'
       ].join('\n');
       document.head.appendChild(style);
